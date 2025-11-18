@@ -269,16 +269,57 @@ def fuzzy_score(a: str, b: str) -> float:
     score = (0.45 * lp) + (0.35 * overlap) + (0.20 * lcs)
     return score
 
-def fuzzy_match_column(col: str, target_list: list) -> str or None:
+def fuzzy_match_column(col: str, target_list: list, feed_sample=None) -> str or None:
+    """
+    A safer fuzzy matcher:
+    - Avoids mapping free-text fields like title/description to enum fields.
+    - Rejects mapping when col values look like long free-text.
+    """
     canon = canonicalize(col)
+
+    # -------- PROTECTION 1: Never map these feed fields to enums --------
+    free_text_like = ["title", "description", "item_group_title"]
+    for f in free_text_like:
+        if f in col.lower():
+            return f
+
+    # detect potential free-text column by data profile
+    if feed_sample is not None and col in feed_sample.columns:
+        sample_vals = feed_sample[col].dropna().astype(str).tolist()
+        if len(sample_vals) > 10:
+            avg_len = sum(len(v) for v in sample_vals[:50]) / min(len(sample_vals), 50)
+            distinct_ratio = len(set(sample_vals[:50])) / 50
+            looks_free_text = avg_len > 10 and distinct_ratio > 0.8
+
+            if looks_free_text:
+                # If target field has controlled values (enum), reject match
+                enum_fields = ["condition", "gender", "age_group", 
+                               "availability", "pickup_method", "relationship_type"]
+                # Only return exact match for "title" style names
+                if canon in ["title", "producttitle", "name", "productname"]:
+                    return "title"
+                for t in target_list:
+                    if t.lower() in enum_fields:
+                        continue
+                # Allow fuzzy to continue for non-enum fields
+                # but prefer matching to title if very free-text-like
+                if "title" in col.lower():
+                    return "title"
+
+    # Keep your original logic below
+    # -------- EXACT MATCH CHECK --------
     for t in target_list:
         if canonicalize(t) == canon:
             return t
+
+    # -------- TOKEN OVERLAP --------
     tokens = re.split(r"[_\-\s\.]+", str(col).lower())
     for t in target_list:
         tkns = re.split(r"[_\-\s\.]+", str(t).lower())
         if any(tok in t.lower() for tok in tokens if len(tok) > 2):
             return t
+
+    # -------- FUZZY SCORING --------
     best = None
     best_score = 0.0
     for t in target_list:
@@ -287,25 +328,13 @@ def fuzzy_match_column(col: str, target_list: list) -> str or None:
         if score > best_score:
             best_score = score
             best = t
-    if best_score >= 0.45:
+
+    # threshold too low → false matches
+    if best_score >= 0.55:
         return best
+
     return None
 
-def apply_fuzzy_mapping(feed_df: pd.DataFrame, spec_df: pd.DataFrame) -> pd.DataFrame:
-    spec_cols = spec_df['Attribute'].tolist()
-    mapping = {}
-    used_targets = set()
-    for c in list(feed_df.columns):
-        match = fuzzy_match_column(c, spec_cols)
-        if match and match not in used_targets:
-            mapping[c] = match
-            used_targets.add(match)
-        elif match and match in used_targets:
-            mapping[c] = f"{match}__alt"
-        else:
-            mapping[c] = c
-    new_df = feed_df.rename(columns=mapping)
-    return new_df
 
 # -------------------------
 # Spec parsing helpers (requirement, type checks, rules) unchanged

@@ -1,3 +1,4 @@
+# app.py
 import streamlit as st
 import pandas as pd
 import json
@@ -6,10 +7,10 @@ from io import StringIO, BytesIO
 import re
 from datetime import datetime
 
-st.set_page_config(page_title="Auto Schema Feed Validator — Embedded Spec", layout="wide")
+st.set_page_config(page_title="Auto Schema Feed Validator — Product-Level", layout="wide")
 
 # -------------------------
-# EMBEDDED SPEC CSV (TAB-SEP)
+# EMBEDDED SPEC (TAB-SEP)
 # -------------------------
 SPEC_CSV = """Attribute\tData Type\tSupported Values\tDescription\tExample\tRequirement\tDependencies\tValidation Rules
 enable_search\tEnum\ttrue, false\tControls whether the product can be surfaced in ChatGPT search results.\tTRUE\tRequired\t—\tLower-case string
@@ -83,9 +84,6 @@ geo_price\tNumber + currency\tRegion-specific price\tPrice by region\t79.99 USD 
 geo_availability\tString\tRegion-specific availability\tAvailability per region\tin_stock (Texas), out_of_stock (New York)\tRecommended\t—\tRegions must be valid ISO 3166 codes
 """
 
-# -------------------------
-# Read spec into DataFrame
-# -------------------------
 @st.cache_data
 def load_spec_df_from_string(spec_text: str) -> pd.DataFrame:
     df = pd.read_csv(StringIO(spec_text), sep="\t", engine="python")
@@ -95,7 +93,7 @@ def load_spec_df_from_string(spec_text: str) -> pd.DataFrame:
 spec_df = load_spec_df_from_string(SPEC_CSV)
 
 # -------------------------
-# Flatten helpers (JSON)
+# Flatten helpers
 # -------------------------
 def _flatten_json(obj, prefix="", out=None):
     if out is None:
@@ -105,7 +103,7 @@ def _flatten_json(obj, prefix="", out=None):
             key = f"{prefix}.{k}" if prefix else k
             _flatten_json(v, key, out)
     elif isinstance(obj, list):
-        # if list of scalars, join; else index
+        # if list of scalars, join; else index each element
         if all(not isinstance(i, (dict, list)) for i in obj):
             out[prefix] = "|".join([str(i) for i in obj if i is not None])
         else:
@@ -126,7 +124,7 @@ def json_to_records(file_bytes: BytesIO) -> pd.DataFrame:
             records.append(_flatten_json(item))
         return pd.DataFrame(records)
     if isinstance(data, dict):
-        # find largest list anywhere
+        # locate largest list anywhere and treat it as records
         candidate_lists = []
         def walk(d):
             if isinstance(d, dict):
@@ -143,13 +141,9 @@ def json_to_records(file_bytes: BytesIO) -> pd.DataFrame:
                     merged.update(item)
                 records.append(_flatten_json(merged))
             return pd.DataFrame(records)
-        # single object
         return pd.DataFrame([_flatten_json(data)])
     return pd.DataFrame()
 
-# -------------------------
-# XML parsing -> records
-# -------------------------
 def xml_to_dict(elem):
     out = {}
     out.update(elem.attrib)
@@ -243,7 +237,6 @@ def check_type(series: pd.Series, dtype_str: str):
         if not ok.all():
             return False, "Some values do not start with http(s)://"
         return True, ""
-    # default string
     return True, ""
 
 def check_supported_values(series: pd.Series, supported_str: str):
@@ -268,21 +261,22 @@ def apply_validation_rules(series: pd.Series, rules_text: str):
     details = []
     s = series.dropna().astype(str)
     for p in parts:
-        if p.startswith("max"):
+        low = p.lower()
+        if low.startswith("max"):
             m = re.search(r"max\s*\D*(\d+)", p)
             if m:
                 mx = int(m.group(1))
                 too_long = s.apply(len) > mx
                 if too_long.any():
                     details.append(f"{too_long.sum()} values exceed max length {mx}")
-        elif p.startswith("min"):
+        elif low.startswith("min"):
             m = re.search(r"min\s*\D*(\d+)", p)
             if m:
                 mn = int(m.group(1))
                 too_short = s.apply(len) < mn
                 if too_short.any():
                     details.append(f"{too_short.sum()} values shorter than min length {mn}")
-        elif p.startswith("regex:"):
+        elif low.startswith("regex:"):
             pattern = p.split("regex:",1)[1]
             try:
                 pat = re.compile(pattern)
@@ -291,8 +285,8 @@ def apply_validation_rules(series: pd.Series, rules_text: str):
                     details.append(f"{bad.sum()} values do not match regex")
             except Exception as e:
                 details.append(f"Invalid regex: {e}")
-        elif p.lower().startswith("unique"):
-            if "yes" in p.lower() or "true" in p.lower():
+        elif "unique" in low:
+            if "yes" in low or "true" in low:
                 dup = s.duplicated().sum()
                 if dup>0:
                     details.append(f"{dup} duplicate values (should be unique)")
@@ -300,32 +294,127 @@ def apply_validation_rules(series: pd.Series, rules_text: str):
     return ok, "; ".join(details)
 
 # -------------------------
-# Main validation
+# Per-product validator
 # -------------------------
-def validate_feed(spec_df: pd.DataFrame, feed_df: pd.DataFrame):
+def validate_product_record(record: dict, spec_df: pd.DataFrame):
+    """
+    record: flattened dict for one product
+    returns: dict {missing:[], empty:[], type_issues:[], value_issues:[], validation_issues:[], extras:[]}
+    """
+    issues = {
+        "missing": [],
+        "empty": [],
+        "type_issues": [],
+        "value_issues": [],
+        "validation_issues": [],
+        "extras": []
+    }
+    rec_keys_norm = {k.lower(): k for k in record.keys()}
+
+    spec_attrs = spec_df['Attribute'].tolist()
+    spec_norm = [a.lower() for a in spec_attrs]
+
+    # check for extras
+    for k in record.keys():
+        if k.lower() not in spec_norm:
+            issues["extras"].append(k)
+
+    # check each spec attribute
+    for _, srow in spec_df.iterrows():
+        attr = srow['Attribute']
+        a_norm = attr.lower()
+        requirement = parse_requirement(srow.get('Requirement', ""))
+        dtype = srow.get('Data Type', "")
+        supported = srow.get('Supported Values', "")
+        vrules = srow.get('Validation Rules', "")
+
+        if a_norm not in rec_keys_norm:
+            if requirement == "Required":
+                issues["missing"].append(attr)
+            elif requirement == "Recommended":
+                # recommended missing flagged as warning in missing for product-level
+                issues["missing"].append(attr + " (recommended)")
+            continue
+
+        val = record.get(rec_keys_norm[a_norm])
+        # check empty
+        if val is None or (isinstance(val, str) and str(val).strip() == ""):
+            # consider required/important emptiness
+            if requirement == "Required":
+                issues["empty"].append(attr)
+            continue
+
+        # simple single-value checks
+        series = pd.Series([val])
+        ok_type, tdet = check_type(series, dtype)
+        if not ok_type:
+            issues["type_issues"].append(f"{attr}: {tdet}")
+
+        ok_vals, vdet = check_supported_values(series, supported)
+        if not ok_vals:
+            issues["value_issues"].append(f"{attr}: {vdet}")
+
+        ok_rules, rdet = apply_validation_rules(series, vrules)
+        if not ok_rules:
+            issues["validation_issues"].append(f"{attr}: {rdet}")
+
+    return issues
+
+# -------------------------
+# Field coverage summary
+# -------------------------
+def coverage_summary(feed_df: pd.DataFrame, spec_df: pd.DataFrame):
+    rows = []
+    for _, srow in spec_df.iterrows():
+        attr = srow['Attribute']
+        a_norm = attr.lower()
+        present = False
+        filled_pct = 0.0
+        example = ""
+        for c in feed_df.columns:
+            if c.lower() == a_norm:
+                present = True
+                filled_pct = 100.0 - feed_df[c].isna().mean() * 100.0
+                non_nulls = feed_df[c].dropna().astype(str)
+                example = non_nulls.iloc[0] if not non_nulls.empty else ""
+                break
+        rows.append({
+            "Attribute": attr,
+            "Present": present,
+            "% Filled": f"{filled_pct:.1f}%" if present else "0.0%",
+            "Example Value": example
+        })
+    # also list extras
+    spec_norm_set = set([a.lower() for a in spec_df['Attribute'].tolist()])
+    extras = [c for c in feed_df.columns if c.lower() not in spec_norm_set]
+    if extras:
+        rows.append({
+            "Attribute": "(Extra fields)",
+            "Present": True,
+            "% Filled": "",
+            "Example Value": ", ".join(extras[:20])
+        })
+    return pd.DataFrame(rows)
+
+# -------------------------
+# Main validate_feed (attribute-level)
+# -------------------------
+def validate_feed_attribute_level(spec_df: pd.DataFrame, feed_df: pd.DataFrame):
     spec_df = spec_df.copy()
     spec_df['Attribute_norm'] = spec_df['Attribute'].astype(str).str.strip().str.lower()
     feed_cols = list(feed_df.columns)
     feed_cols_norm = [c.lower() for c in feed_cols]
-
     report_rows = []
-    # sample map for dependency checking (first row)
-    sample_map = {}
-    if not feed_df.empty:
-        first = feed_df.iloc[0].to_dict()
-        sample_map = {k: (v if pd.notna(v) else None) for k,v in first.items()}
 
     for _, srow in spec_df.iterrows():
         attr = srow['Attribute']
-        attr_norm = srow['Attribute_norm']
+        a_norm = srow['Attribute_norm']
         dtype = srow.get('Data Type', "")
         supported = srow.get('Supported Values', "")
         requirement = parse_requirement(srow.get('Requirement', ""))
-        validation_rules = srow.get('Validation Rules', "")
-        dependencies = srow.get('Dependencies', "")
+        vrules = srow.get('Validation Rules', "")
 
-        exists = attr_norm in feed_cols_norm
-        if not exists:
+        if a_norm not in feed_cols_norm:
             if requirement == "Required":
                 status = "❌ Missing (Required)"
             elif requirement == "Recommended":
@@ -343,10 +432,8 @@ def validate_feed(spec_df: pd.DataFrame, feed_df: pd.DataFrame):
             })
             continue
 
-        # present -> run checks (against all rows)
-        orig_col = feed_cols[feed_cols_norm.index(attr_norm)]
+        orig_col = feed_cols[feed_cols_norm.index(a_norm)]
         col = feed_df[orig_col]
-
         details = []
         empty_pct = col.isna().mean() * 100
         if empty_pct > 0:
@@ -360,18 +447,9 @@ def validate_feed(spec_df: pd.DataFrame, feed_df: pd.DataFrame):
         if not ok_vals:
             details.append(vdet)
 
-        ok_rules, rdet = apply_validation_rules(col, validation_rules)
+        ok_rules, rdet = apply_validation_rules(col, vrules)
         if not ok_rules:
             details.append(rdet)
-
-        # dependencies best-effort (informational)
-        dep_notes = []
-        if not pd.isna(dependencies) and str(dependencies).strip() != "":
-            # simple check: if "enabled_checkout" mentioned and sample_map shows missing or false, note it
-            if "enabled_checkout" in str(dependencies).lower() and sample_map.get("enable_checkout") not in (True,"true","TRUE","True","1","yes"):
-                dep_notes.append("Dependency note: enable_checkout not true in sample row")
-        if dep_notes:
-            details += dep_notes
 
         status = "✅ Present & Valid" if not details else "⚠️ Issues"
         report_rows.append({
@@ -384,7 +462,7 @@ def validate_feed(spec_df: pd.DataFrame, feed_df: pd.DataFrame):
             "Example": srow.get("Example","")
         })
 
-    # extras
+    # extras summary
     spec_set = set(spec_df['Attribute_norm'].tolist())
     extras = [c for c in feed_cols if c.lower() not in spec_set]
     if extras:
@@ -403,12 +481,13 @@ def validate_feed(spec_df: pd.DataFrame, feed_df: pd.DataFrame):
 # -------------------------
 # UI
 # -------------------------
-st.title("🔎 Auto Schema Feed Validator — Embedded Spec")
-st.write("Spec is embedded in the app. Upload a JSON or XML product feed. The entire feed will be flattened and validated against the embedded spec.")
+st.title("🔎 Auto Schema Feed Validator — Product-Level (id used as identifier)")
+st.write("Spec is embedded in the app. Upload JSON or XML product feed. The entire feed is validated and each product has an expandable panel showing issues & raw fields.")
 
-st.sidebar.header("About")
-st.sidebar.write("Spec columns: Attribute, Data Type, Supported Values, Description, Example, Requirement, Dependencies, Validation Rules")
-st.sidebar.write("Note: Validation runs on the full dataset (all rows).")
+st.sidebar.header("Controls")
+show_limit = st.sidebar.number_input("Max products to expand in UI (set to avoid UI overload)", min_value=10, max_value=2000, value=200, step=10)
+show_all_products = st.sidebar.checkbox("Allow expanding beyond limit (may be slow for very large feeds)", value=False)
+st.sidebar.write("You can still download full product-level CSVs for deeper analysis.")
 
 uploaded = st.file_uploader("Upload product feed (JSON or XML)", type=["json","xml"])
 if uploaded is None:
@@ -424,24 +503,82 @@ else:
         if feed_df is None or feed_df.empty:
             st.error("Unable to parse feed into records. Check structure.")
         else:
-            st.success(f"Parsed {len(feed_df)} record(s). Running full validation (all rows)...")
-            with st.spinner("Validating (this checks all rows)..."):
-                report = validate_feed(spec_df, feed_df)
+            # normalize column names to be strings
+            feed_df.columns = [str(c) for c in feed_df.columns]
 
-            st.write("### Validation report (per-attribute)")
-            st.dataframe(report, use_container_width=True)
+            st.success(f"Parsed {len(feed_df)} record(s). Running validation on full dataset...")
+            # attribute-level report
+            with st.spinner("Running attribute-level validation..."):
+                attr_report = validate_feed_attribute_level(spec_df, feed_df)
 
-            csv_bytes = report.to_csv(index=False).encode("utf-8")
-            st.download_button("⬇️ Download validation report (CSV)", csv_bytes, file_name="validation_report.csv", mime="text/csv")
+            st.markdown("## 1) Field coverage summary")
+            cov = coverage_summary(feed_df, spec_df)
+            st.dataframe(cov, use_container_width=True)
+            st.download_button("⬇️ Download field coverage (CSV)", cov.to_csv(index=False).encode("utf-8"), "field_coverage.csv", "text/csv")
 
-            # Offer skeleton for missing required attributes
-            missing_required = report[report['Status'].str.contains("Missing") & (report['Requirement']=="Required")]
-            if not missing_required.empty:
-                st.warning(f"{len(missing_required)} required attributes missing from feed.")
-                if st.button("Generate skeleton CSV with missing required columns"):
-                    required_cols = missing_required['Attribute'].tolist()
-                    skeleton_cols = list(feed_df.columns) + required_cols
-                    skeleton_df = pd.DataFrame(columns=skeleton_cols)
-                    st.download_button("⬇️ Download skeleton CSV", skeleton_df.to_csv(index=False).encode("utf-8"), "skeleton.csv", "text/csv")
+            st.markdown("## 2) Attribute-level validation report")
+            st.dataframe(attr_report, use_container_width=True)
+            st.download_button("⬇️ Download attribute-level report (CSV)", attr_report.to_csv(index=False).encode("utf-8"), "attribute_report.csv", "text/csv")
+
+            # product-level checks (full)
+            st.markdown("## 3) Product-level issues (expandable per-product)")
+            product_issues_rows = []
+            max_show = len(feed_df) if show_all_products else min(len(feed_df), int(show_limit))
+
+            for idx, row in feed_df.iterrows():
+                flattened_record = {k: row[k] for k in feed_df.columns}
+                issues = validate_product_record(flattened_record, spec_df)
+
+                # create summary string
+                summary_parts = []
+                if issues["missing"]:
+                    summary_parts.append(f"Missing: {', '.join(issues['missing'][:8])}" + ("..." if len(issues['missing'])>8 else ""))
+                if issues["empty"]:
+                    summary_parts.append(f"Empty: {', '.join(issues['empty'][:8])}" + ("..." if len(issues['empty'])>8 else ""))
+                if issues["type_issues"]:
+                    summary_parts.append(f"Type: {', '.join(issues['type_issues'][:6])}" + ("..." if len(issues['type_issues'])>6 else ""))
+                if issues["value_issues"]:
+                    summary_parts.append(f"Value: {', '.join(issues['value_issues'][:6])}" + ("..." if len(issues['value_issues'])>6 else ""))
+                if issues["validation_issues"]:
+                    summary_parts.append(f"Rule: {', '.join(issues['validation_issues'][:6])}" + ("..." if len(issues['validation_issues'])>6 else ""))
+                if issues["extras"]:
+                    summary_parts.append(f"Extras: {', '.join(issues['extras'][:6])}" + ("..." if len(issues['extras'])>6 else ""))
+
+                summary = " | ".join(summary_parts) if summary_parts else "No issues"
+
+                # product identifier
+                prod_id = flattened_record.get('id') or flattened_record.get('ID') or flattened_record.get('Id') or ""
+                header = f"Product #{idx}"
+                if prod_id:
+                    header += f" — id: {prod_id}"
+
+                # expandable UI only up to max_show (avoid rendering thousands)
+                if idx < max_show:
+                    with st.expander(f"{header} — {summary}", expanded=False):
+                        st.write("**Summary:**")
+                        st.write(summary)
+                        st.write("**Issues detail:**")
+                        st.json(issues)
+                        st.write("**Raw fields for this product (flattened)**:")
+                        st.dataframe(pd.DataFrame([flattened_record]).T.rename(columns={0:"value"}), use_container_width=True)
+                # always collect product issues into CSV
+                product_issues_rows.append({
+                    "record_index": idx,
+                    "id": prod_id,
+                    "summary": summary,
+                    "missing": "|".join(issues["missing"]),
+                    "empty": "|".join(issues["empty"]),
+                    "type_issues": "|".join(issues["type_issues"]),
+                    "value_issues": "|".join(issues["value_issues"]),
+                    "validation_issues": "|".join(issues["validation_issues"]),
+                    "extras": "|".join(issues["extras"])
+                })
+
+            product_issues_df = pd.DataFrame(product_issues_rows)
+            st.markdown("### Product-level issues summary")
+            st.dataframe(product_issues_df.head(200), use_container_width=True)
+            st.download_button("⬇️ Download full product-level issues CSV", product_issues_df.to_csv(index=False).encode("utf-8"), "product_issues.csv", "text/csv")
+
+            st.info("If your feed is large, use the CSV downloads for complete analysis. You can increase 'Max products to expand' in the sidebar if you need to inspect more items in the UI.")
     except Exception as e:
         st.error(f"Failed to parse/validate feed: {e}")

@@ -1,4 +1,7 @@
-# app.py — Auto-enriched Feed Builder + Fuzzy Mapping + Product-Level Validator
+# ============================================================
+# PART 1 — IMPORTS, SPEC, PARSING, SMART FUZZY MAPPER
+# ============================================================
+
 import streamlit as st
 import pandas as pd
 import json
@@ -8,365 +11,310 @@ import re
 from datetime import datetime
 import os
 
-st.set_page_config(page_title="Auto Schema Feed Validator — Enriched", layout="wide")
+st.set_page_config(page_title="Auto-Enriched ChatGPT Feed Validator", layout="wide")
 
-# -------------------------
-# EMBEDDED SPEC (TAB-SEP)
-# -------------------------
+# ============================================================
+# 1. EMBEDDED CHATGPT PRODUCT FEED SPEC
+# ============================================================
 SPEC_CSV = """Attribute\tData Type\tSupported Values\tDescription\tExample\tRequirement\tDependencies\tValidation Rules
 enable_search\tEnum\ttrue, false\tControls whether the product can be surfaced in ChatGPT search results.\tTRUE\tRequired\t—\tLower-case string
-enable_checkout\tEnum\ttrue, false\t"Allows direct purchase inside ChatGPT.
-enable_search must be true in order for enable_checkout to be enabled for the product."\tTRUE\tRequired\t—\tLower-case string
-id\tString (alphanumeric)\t—\tMerchant product ID (unique)\tSKU12345\tRequired\t—\tMax 100 chars; must remain stable over time
-gtin\tString (numeric)\tGTIN, UPC, ISBN\tUniversal product identifier\t1.23457E+11\tRecommended\t—\t8–14 digits; no dashes or spaces
-mpn\tString (alphanumeric)\t—\tManufacturer part number\tGPT5\tRequired if gtin missing\tRequired if gtin is absent\tMax 70 chars
-title\tString (UTF-8 text)\t—\tProduct title\tMen's Trail Running Shoes Black\tRequired\t—\tMax 150 chars; avoid all-caps
-description\tString (UTF-8 text)\t—\tFull product description\tWaterproof trail shoe with cushioned sole…\tRequired\t—\tMax 5,000 chars; plain text only
-link\tURL\tRFC 1738\tProduct detail page URL\thttps://example.com/product/SKU12345\tRequired\t—\tMust resolve with HTTP 200; HTTPS preferred
-condition\tEnum\tnew, refurbished, used\tCondition of product\tnew\tRequired if product condition differs from new\t—\tLower-case string
-product_category\tString\tCategory taxonomy\tCategory path\tApparel & Accessories > Shoes\tRequired\t—\tUse “>” separator
-brand\tString\t—\tProduct brand\tOpenAI\tRequired for all excluding movies, books, and musical recording brands\t—\tMax 70 chars
-material\tString\t—\tPrimary material(s\tLeather\tRequired\t—\tMax 100 chars
-dimensions\tString\tLxWxH unit\tOverall dimensions\t12x8x5 in\tOptional\t—\tUnits required if provided
-length\tNumber + unit\t—\tIndividual dimension\t10 mm\tOptional\tProvide all three if using individual fields\tUnits required
-width\tNumber + unit\t—\tIndividual dimension\t10 mm\tOptional\tProvide all three if using individual fields\tUnits required
-height\tNumber + unit\t—\tIndividual dimension\t10 mm\tOptional\tProvide all three if using individual fields\tUnits required
-weight\tNumber + unit\t—\tProduct weight\t1.5 lb\tRequired\t—\tPositive number with unit
+enable_checkout\tEnum\ttrue, false\tAllows direct purchase...\tTRUE\tRequired\t—\tLower-case string
+id\tString (alphanumeric)\t—\tMerchant product ID\tSKU12345\tRequired\t—\tMax 100 chars
+gtin\tString (numeric)\tGTIN, UPC, ISBN\tUniversal product identifier\t1.23457E+11\tRecommended\t—\t8–14 digits
+mpn\tString (alphanumeric)\t—\tManufacturer part number\tGPT5\tRequired if gtin missing\t—\tMax 70 chars
+title\tString\t—\tProduct title\tRunning Shoes\tRequired\t—\tMax 150 chars
+description\tString\t—\tFull description\tWaterproof trail shoe\tRequired\t—\tMax 5000 chars
+link\tURL\tRFC 1738\tProduct detail page\thttps://example.com\tRequired\t—\tMust be HTTP 200
+condition\tEnum\tnew, refurbished, used\tCondition\tnew\tRequired if differs\t—\tLower-case string
+product_category\tString\t—\tCategory taxonomy\tShoes\tRequired\t—\tUse “>”
+brand\tString\t—\tBrand\tOpenAI\tRequired\t—\tMax 70 chars
+material\tString\t—\tMaterial\tLeather\tRequired\t—\tMax 100 chars
+dimensions\tString\t—\tDimensions\t10x5x3 in\tOptional\t—\tUnits required
+length\tNumber + unit\t—\tLength\t10 mm\tOptional\tProvide 3 dims\tUnits required
+width\tNumber + unit\t—\tWidth\t10 mm\tOptional\tProvide 3 dims\tUnits required
+height\tNumber + unit\t—\tHeight\t10 mm\tOptional\tProvide 3 dims\tUnits required
+weight\tNumber + unit\t—\tWeight\t1.5 lb\tRequired\t—\tPositive number
 age_group\tEnum\tnewborn, infant, toddler, kids, adult\tTarget demographic\tadult\tOptional\t—\tLower-case string
-image_link\tURL\tRFC 1738\tMain product image URL\thttps://example.com/image1.jpg\tRequired\t—\tJPEG/PNG; HTTPS preferred
-additional_image_link\tURL array\tRFC 1738\tExtra images\thttps://example.com/image2.jpg,…\tOptional\t—\tComma-separated or array
-video_link\tURL\tRFC 1738\tProduct video\thttps://youtu.be/12345\tOptional\t—\tMust be publicly accessible
-model_3d_link\tURL\tRFC 1738\t3D model\thttps://example.com/model.glb\tOptional\t—\tGLB/GLTF preferred
-price\tNumber + currency\tISO 4217\tRegular price\t79.99 USD\tRequired\t—\tMust include currency code
-sale_price\tNumber + currency\tISO 4217\tDiscounted price\t59.99 USD\tOptional\t—\tMust be ≤ price
-sale_price_effective_date\tDate range\tISO 8601\tSale window\t2025-07-01 / 2025-07-15\tOptional\tRequired if sale_price provided\tStart must precede end
-unit_pricing_measure / base_measure\tNumber + unit\t—\tUnit price & base measure\t16 oz / 1 oz\tOptional\t—\tBoth fields required together
-pricing_trend\tString\t—\tLowest price in N months\tLowest price in 6 months\tOptional\t—\tMax 80 chars
-availability\tEnum\tin_stock, out_of_stock, preorder\tProduct availability\tin_stock\tRequired\t—\tLower-case string
-availability_date\tDate\tISO 8601\tAvailability date if preorder\t01-12-2025\tRequired if availability=preorder\t—\tMust be future date
-inventory_quantity\tInteger\t—\tStock count\t25\tRequired\t—\tNon-negative integer
-expiration_date\tDate\tISO 8601\tRemove product after date\t01-12-2025\tOptional\t—\tMust be future date
-pickup_method\tEnum\tin_store, reserve, not_supported\tPickup options\tin_store\tOptional\t—\tLower-case string
-pickup_sla\tNumber + duration\t—\tPickup SLA\t1 day\tOptional\tRequires pickup_method\tPositive integer + unit
-item_group_id\tString\t—\tVariant group ID\tSHOE123GROUP\tRequired if variants exist\t—\tMax 70 chars
-item_group_title\tString (UTF-8 text)\t—\tGroup product title\tMen's Trail Running Shoes\tOptional\t—\tMax 150 chars; avoid all-caps
-color\tString\t—\tVariant color\tBlue\tRecommended (apparel)\t—\tMax 40 chars
-size\tString\t—\tVariant size\t10\tRecommended (apparel)\t—\tMax 20 chars
-size_system\tCountry code\tISO 3166\tSize system\tUS\tRecommended (apparel)\t—\t2-letter country code
-gender\tEnum\tmale, female, unisex\tGender target\tmale\tRecommended (apparel)\t—\tLower-case string
-offer_id\tString\t—\tOffer ID (SKU+seller+price)\tSKU12345-Blue-79.99\tRecommended\t—\tUnique within feed
-Custom_variant1_category\tString\t—\tCustom variant dimension 1\tSize_Type\tOptional\t—\t—
-Custom_variant1_option\tString\t—\tCustom variant 1 option\tPetite / Tall / Maternity\tOptional\t—\t—
-Custom_variant2_category\tString\t—\tCustom variant dimension 2\tWood_Type\tOptional\t—\t—
-Custom_variant2_option\tString\t—\tCustom variant 2 option\tOak / Mahogany / Walnut\tOptional\t—\t—
-Custom_variant3_category\tString\t—\tCustom variant dimension 3\tCap_Type\tOptional\t—\t—
-Custom_variant3_option\tString\t—\tCustom variant 3 option\tSnapback / Fitted\tOptional\t—\t—
-shipping\tString\tcountry:region:service_class:price\tShipping method/cost/region\tUS:CA:Overnight:16.00 USD\tRequired where applicable\t—\tMultiple entries allowed; use colon separators
-delivery_estimate\tDate\tISO 8601\tEstimated arrival date\t12-08-2025\tOptional\t—\tMust be future date
-seller_name\tString\t—\tSeller name\tExample Store\tRequired / Display\t—\tMax 70 chars
-seller_url\tURL\tRFC 1738\tSeller page\thttps://example.com/store\tRequired\t—\tHTTPS preferred
-seller_privacy_policy\tURL\tRFC 1738\tSeller-specific policies\thttps://example.com/privacy\tRequired, if enabled_checkout is true\t—\tHTTPS preferred
-seller_tos\tURL\tRFC 1738\tSeller-specific terms of service\thttps://example.com/terms\tRequired, if enabled_checkout is true\t—\tHTTPS preferred
-return_policy\tURL\tRFC 1738\tReturn policy URL\thttps://example.com/returns\tRequired\t—\tHTTPS preferred
-return_window\tInteger\tDays\tDays allowed for return\t30\tRequired\t—\tPositive integer
-popularity_score\tNumber\t—\tPopularity indicator\t4.7\tRecommended\t—\t0–5 scale or merchant-defined
-return_rate\tNumber\tPercentage\tReturn rate\t2%\tRecommended\t—\t0–100%
-warning / warning_url\tString / URL\t—\tProduct disclaimers\tContains lithium battery, or CA Prop 65 warning\tRecommended for Checkout\t—\tIf URL, must resolve HTTP 200
-age_restriction\tNumber\t—\tMinimum purchase age\t21\tRecommended\t—\tPositive integer
-product_review_count\tInteger\t—\tNumber of product reviews\t254\tRecommended\t—\tNon-negative
-product_review_rating\tNumber\t—\tAverage review score\t4.6\tRecommended\t—\t0–5 scale
-store_review_count\tInteger\t—\tNumber of brand/store reviews\t2000\tOptional\t—\tNon-negative
-store_review_rating\tNumber\t—\tAverage store rating\t4.8\tOptional\t—\t0–5 scale
-q_and_a\tString\t—\tFAQ content\tQ: Is this waterproof? A: Yes\tRecommended\t—\tPlain text
-raw_review_data\tString\t—\tRaw review payload\t—\tRecommended\t—\tMay include JSON blob
-related_product_id\tString\t—\tAssociated product IDs\tSKU67890\tRecommended\t—\tComma-separated list allowed
-relationship_type\tEnum\tpart_of_set, required_part, often_bought_with, substitute, different_brand, accessory\tRelationship type\tpart_of_set\tRecommended\t—\tLower-case string
-geo_price\tNumber + currency\tRegion-specific price\tPrice by region\t79.99 USD (California)\tRecommended\t—\tMust include ISO 4217 currency
-geo_availability\tString\tRegion-specific availability\tAvailability per region\tin_stock (Texas), out_of_stock (New York)\tRecommended\t—\tRegions must be valid ISO 3166 codes
+image_link\tURL\tRFC 1738\tMain image\thttps://example.com/img.jpg\tRequired\t—\tJPEG/PNG
+additional_image_link\tURL array\tRFC 1738\tExtra images\t...\tOptional\t—\tComma separated
+video_link\tURL\tRFC 1738\tProduct video\thttps://... \tOptional\t—\tMust be public
+model_3d_link\tURL\tRFC 1738\t3D model\t...\tOptional\t—\tGLB preferred
+price\tNumber + currency\tISO 4217\tRegular price\t79.99 USD\tRequired\t—\tMust include currency
+sale_price\tNumber + currency\tISO 4217\tSale price\t59.99 USD\tOptional\t—\tMust be <= price
+availability\tEnum\tin_stock, out_of_stock, preorder\tAvailability\tin_stock\tRequired\t—\tLower-case
+inventory_quantity\tInteger\t—\tStock count\t25\tRequired\t—\t>=0
+seller_name\tString\t—\tSeller name\tExample Store\tRequired\t—\tMax 70 chars
+seller_url\tURL\tRFC 1738\tSeller page\thttps://example.com\tRequired\t—\tHTTPS preferred
+seller_privacy_policy\tURL\tRFC 1738\tPrivacy policy\thttps://...\tRequired if checkout\t—\tHTTPS
+seller_tos\tURL\tRFC 1738\tTerms of service\thttps://...\tRequired if checkout\t—\tHTTPS
+return_policy\tURL\tRFC 1738\tReturn policy\thttps://...\tRequired\t—\tHTTPS
+return_window\tInteger\tDays\tNumber of days\t30\tRequired\t—\tPositive
 """
 
-# -------------------------
-# Load spec into DataFrame
-# -------------------------
 @st.cache_data
-def load_spec_df_from_string(spec_text: str) -> pd.DataFrame:
-    df = pd.read_csv(StringIO(spec_text), sep="\t", engine="python")
-    df.columns = [c.strip() for c in df.columns]
-    return df
+def load_spec_df():
+    return pd.read_csv(StringIO(SPEC_CSV), sep="\t")
 
-spec_df = load_spec_df_from_string(SPEC_CSV)
+spec_df = load_spec_df()
 
-# -------------------------
-# Flatten helpers (JSON)
-# -------------------------
+# ============================================================
+# 2. JSON & XML PARSING HELPERS
+# ============================================================
 def _flatten_json(obj, prefix="", out=None):
     if out is None:
         out = {}
     if isinstance(obj, dict):
         for k, v in obj.items():
-            key = f"{prefix}.{k}" if prefix else k
-            _flatten_json(v, key, out)
+            new_key = f"{prefix}.{k}" if prefix else k
+            _flatten_json(v, new_key, out)
     elif isinstance(obj, list):
-        # if list of scalars, join; else index each element
         if all(not isinstance(i, (dict, list)) for i in obj):
-            out[prefix] = "|".join([str(i) for i in obj if i is not None])
+            out[prefix] = "|".join([str(i) for i in obj])
         else:
             for idx, item in enumerate(obj):
-                key = f"{prefix}.{idx}" if prefix else str(idx)
-                _flatten_json(item, key, out)
+                new_key = f"{prefix}.{idx}"
+                _flatten_json(item, new_key, out)
     else:
         out[prefix] = obj
     return out
 
-# new: parse JSON and return list of raw items + flattened df
-def json_to_records_with_raw(file_bytes: BytesIO):
+def json_to_records_with_raw(file_bytes):
     file_bytes.seek(0)
-    data_text = file_bytes.read().decode("utf-8", errors="ignore")
-    data = json.loads(data_text)
-    records = []
+    raw_text = file_bytes.read().decode("utf-8", errors="ignore")
+    data = json.loads(raw_text)
+
+    rows = []
     raw_items = []
+
     if isinstance(data, list):
         for item in data:
             raw_items.append(item)
-            records.append(_flatten_json(item))
-        return pd.DataFrame(records), raw_items
+            rows.append(_flatten_json(item))
+        return pd.DataFrame(rows), raw_items
+
     if isinstance(data, dict):
-        # find largest list anywhere
-        candidate_lists = []
-        def walk(d):
-            if isinstance(d, dict):
-                for k,v in d.items():
-                    walk(v)
-            elif isinstance(d, list):
-                candidate_lists.append(d)
-        walk(data)
-        if candidate_lists:
-            largest = max(candidate_lists, key=len)
-            for item in largest:
-                raw_items.append(item)
-                records.append(_flatten_json(item))
-            return pd.DataFrame(records), raw_items
-        # single object
-        raw_items.append(data)
+        if any(isinstance(v, list) for v in data.values()):
+            for k, v in data.items():
+                if isinstance(v, list) and v:
+                    return pd.DataFrame([_flatten_json(i) for i in v]), v
+        raw_items = [data]
         return pd.DataFrame([_flatten_json(data)]), raw_items
+
     return pd.DataFrame(), []
 
-# -------------------------
-# XML parsing -> records (unchanged)
-# -------------------------
 def xml_to_dict(elem):
-    out = {}
-    out.update(elem.attrib)
+    d = {}
+    d.update(elem.attrib)
     children = list(elem)
     if children:
-        cg = {}
+        grouped = {}
         for ch in children:
-            tag = ch.tag
-            d = xml_to_dict(ch)
-            cg.setdefault(tag, []).append(d)
-        for tag, vals in cg.items():
-            if len(vals) == 1:
-                out[tag] = vals[0]
-            else:
-                out[tag] = vals
+            grouped.setdefault(ch.tag, []).append(xml_to_dict(ch))
+        for k, v in grouped.items():
+            d[k] = v if len(v) > 1 else v[0]
     text = (elem.text or "").strip()
-    if text and not children and not elem.attrib:
+    if text and not d:
         return text
-    elif text:
-        out["_text"] = text
-    return out
+    if text:
+        d["_text"] = text
+    return d
 
-def xml_to_records(file_bytes: BytesIO) -> pd.DataFrame:
+def xml_to_records(file_bytes):
     file_bytes.seek(0)
     text = file_bytes.read().decode("utf-8", errors="ignore")
     root = ET.fromstring(text)
-    tag_counts = {}
+    rows = []
     for child in root:
-        tag_counts[child.tag] = tag_counts.get(child.tag, 0) + 1
-    repeating = [t for t,c in tag_counts.items() if c > 1]
-    records = []
-    if repeating:
-        container = max(repeating, key=lambda t: tag_counts[t])
-        for item in root.findall(f'.//{container}'):
-            d = xml_to_dict(item)
-            records.append(_flatten_json(d))
-    else:
-        for item in list(root):
-            d = xml_to_dict(item)
-            records.append(_flatten_json(d))
-        if not records:
-            records = [_flatten_json(xml_to_dict(root))]
-    return pd.DataFrame(records)
+        rows.append(_flatten_json(xml_to_dict(child)))
+    if not rows:
+        rows.append(_flatten_json(xml_to_dict(root)))
+    return pd.DataFrame(rows)
 
-# -------------------------
-# URL extractor for arrays (NEW)
-# -------------------------
-url_re_global = re.compile(r"https?://[^\s\"']+", re.IGNORECASE)
+# ============================================================
+# 3. SMART URL EXTRACTION (for images/media arrays)
+# ============================================================
+url_re = re.compile(r"https?://[^\s\"']+", re.IGNORECASE)
 
 def extract_urls_from_any(x):
-    """
-    Recursively extract URL-like strings from scalars, dicts, lists.
-    Returns a list of unique URLs in order.
-    """
     urls = []
     if x is None:
         return urls
     if isinstance(x, str):
-        found = url_re_global.findall(x)
-        return found
+        urls.extend(url_re.findall(x))
+        return urls
     if isinstance(x, list):
-        for item in x:
-            for u in extract_urls_from_any(item):
-                if u not in urls:
-                    urls.append(u)
-        return urls
+        for v in x:
+            urls.extend(extract_urls_from_any(v))
+        return list(dict.fromkeys(urls))  # unique
     if isinstance(x, dict):
-        # prioritize common keys
-        for key in ["src","url","image","href","link"]:
-            if key in x and isinstance(x[key], str) and url_re_global.search(x[key]):
-                if x[key] not in urls:
+        for key in ["src", "url", "href", "image", "link"]:
+            if key in x and isinstance(x[key], str):
+                if url_re.search(x[key]):
                     urls.append(x[key])
-        # then scan all values
         for v in x.values():
-            for u in extract_urls_from_any(v):
-                if u not in urls:
-                    urls.append(u)
-        return urls
+            urls.extend(extract_urls_from_any(v))
+        return list(dict.fromkeys(urls))
     return urls
 
-# -------------------------
-# FUZZY HEADER MAPPER (unchanged but included)
-# -------------------------
-def canonicalize(col: str) -> str:
-    col = str(col).lower().strip()
-    col = re.sub(r"[^a-z0-9]+", "", col)
-    col = re.sub(r"^(product|productid|item|prod|p|merchant|seller|offer|sku|sku_code|skuid)","", col)
-    col = re.sub(r"(code|identifier|identifierid|val|value)$","", col)
-    col = re.sub(r"\d+$", "", col)
-    return col
+# ============================================================
+# 4. SMART FUZZY MAPPER (TITLE vs DESCRIPTION LOGIC INCLUDED)
+# ============================================================
 
-def fuzzy_score(a: str, b: str) -> float:
+def canonicalize(col):
+    c = str(col).lower().strip()
+    c = re.sub(r"[^a-z0-9]+", "", c)
+    return c
+
+def fuzzy_score(a, b):
     if not a or not b:
         return 0.0
     prefix_len = len(os.path.commonprefix([a, b]))
     lp = prefix_len / max(len(a), len(b))
-    set_a = set(a)
-    set_b = set(b)
+    set_a, set_b = set(a), set(b)
     overlap = len(set_a & set_b) / max(1, len(set_a | set_b))
-    def longest_common_substr(s1, s2):
+
+    def lcs(s1, s2):
         m = [[0]*(1+len(s2)) for _ in range(1+len(s1))]
         longest = 0
-        for i in range(1, 1+len(s1)):
-            for j in range(1, 1+len(s2)):
+        for i in range(1, len(s1)+1):
+            for j in range(1, len(s2)+1):
                 if s1[i-1] == s2[j-1]:
                     m[i][j] = m[i-1][j-1] + 1
-                    if m[i][j] > longest:
-                        longest = m[i][j]
-                else:
-                    m[i][j] = 0
+                    longest = max(longest, m[i][j])
         return longest
-    lcs = longest_common_substr(a, b) / max(1, min(len(a), len(b)))
-    score = (0.45 * lp) + (0.35 * overlap) + (0.20 * lcs)
-    return score
 
-def fuzzy_match_column(col: str, target_list: list, feed_sample=None) -> str or None:
+    lcs_val = lcs(a, b) / max(1, min(len(a), len(b)))
+    return (0.45 * lp) + (0.35 * overlap) + (0.20 * lcs_val)
+
+def detect_free_text_column(series: pd.Series):
     """
-    A safer fuzzy matcher:
-    - Avoids mapping free-text fields like title/description to enum fields.
-    - Rejects mapping when col values look like long free-text.
+    Detect if column contains long, diverse text → description-like.
     """
-    canon = canonicalize(col)
+    vals = series.dropna().astype(str).head(50).tolist()
+    if len(vals) < 5:
+        return False, False  # not enough data
 
-    # -------- PROTECTION 1: Never map these feed fields to enums --------
-    free_text_like = ["title", "description", "item_group_title"]
-    for f in free_text_like:
-        if f in col.lower():
-            return f
+    avg_len = sum(len(v) for v in vals) / len(vals)
+    distinct_pct = len(set(vals)) / len(vals)
 
-    # detect potential free-text column by data profile
-    if feed_sample is not None and col in feed_sample.columns:
-        sample_vals = feed_sample[col].dropna().astype(str).tolist()
-        if len(sample_vals) > 10:
-            avg_len = sum(len(v) for v in sample_vals[:50]) / min(len(sample_vals), 50)
-            distinct_ratio = len(set(sample_vals[:50])) / 50
-            looks_free_text = avg_len > 10 and distinct_ratio > 0.8
+    is_description_like = avg_len > 40 or distinct_pct > 0.8
+    is_title_like = (10 < avg_len < 40) and (distinct_pct > 0.5)
 
-            if looks_free_text:
-                # If target field has controlled values (enum), reject match
-                enum_fields = ["condition", "gender", "age_group", 
-                               "availability", "pickup_method", "relationship_type"]
-                # Only return exact match for "title" style names
-                if canon in ["title", "producttitle", "name", "productname"]:
-                    return "title"
-                for t in target_list:
-                    if t.lower() in enum_fields:
-                        continue
-                # Allow fuzzy to continue for non-enum fields
-                # but prefer matching to title if very free-text-like
-                if "title" in col.lower():
-                    return "title"
+    return is_title_like, is_description_like
 
-    # Keep your original logic below
-    # -------- EXACT MATCH CHECK --------
-    for t in target_list:
-        if canonicalize(t) == canon:
+def fuzzy_match_column(col, target_fields, feed_df=None):
+    """
+    Smart fuzzy mapper with protection:
+    - Detect free-text cols and assign to title/description appropriately
+    - Avoid mapping these to enum fields
+    - Higher threshold to reduce errors
+    """
+    col_canon = canonicalize(col)
+
+    # Check free-text profile
+    is_title_like = False
+    is_description_like = False
+    if feed_df is not None and col in feed_df.columns:
+        series = feed_df[col]
+        is_title_like, is_description_like = detect_free_text_column(series)
+
+    # Forced mapping if column name explicitly contains these
+    if "title" in col.lower() and not is_description_like:
+        return "title"
+    if "description" in col.lower() or "body_html" in col.lower():
+        return "description"
+
+    # If description-like, map to description only
+    if is_description_like:
+        return "description"
+
+    # If title-like, map to title
+    if is_title_like:
+        return "title"
+
+    # Avoid matching free-text to enum fields
+    enum_fields = {"condition","gender","age_group","availability","pickup_method",
+                   "relationship_type"}
+
+    # Exact canonical match
+    for t in target_fields:
+        if canonicalize(t) == col_canon:
             return t
 
-    # -------- TOKEN OVERLAP --------
-    tokens = re.split(r"[_\-\s\.]+", str(col).lower())
-    for t in target_list:
-        tkns = re.split(r"[_\-\s\.]+", str(t).lower())
+    # Token similarity
+    tokens = re.split(r"[_\-\s\.]+", col.lower())
+    for t in target_fields:
+        t_tokens = re.split(r"[_\-\s\.]+", t.lower())
         if any(tok in t.lower() for tok in tokens if len(tok) > 2):
             return t
 
-    # -------- FUZZY SCORING --------
+    # Fuzzy scoring
     best = None
     best_score = 0.0
-    for t in target_list:
-        tc = canonicalize(t)
-        score = fuzzy_score(canon, tc)
+    for t in target_fields:
+        if t.lower() in enum_fields and (is_title_like or is_description_like):
+            continue  # avoid enum mismatch
+        score = fuzzy_score(col_canon, canonicalize(t))
         if score > best_score:
-            best_score = score
             best = t
+            best_score = score
 
-    # threshold too low → false matches
     if best_score >= 0.55:
         return best
-
     return None
 
+def apply_fuzzy_mapping(df, spec_df):
+    targets = spec_df["Attribute"].tolist()
+    mapping = {}
+    for c in df.columns:
+        match = fuzzy_match_column(c, targets, df)
+        mapping[c] = match if match else c
+    return df.rename(columns=mapping)
+# ============================================================
+# PART 2 — Validation helpers, enrichment, and per-product checks
+# ============================================================
 
 # -------------------------
-# Spec parsing helpers (requirement, type checks, rules) unchanged
+# Requirement parser
 # -------------------------
 def parse_requirement(req):
-    if pd.isna(req):
+    if pd.isna(req) or req is None:
         return "Optional"
-    s = str(req).strip().lower()
+    s = str(req).lower()
     if "required" in s:
         return "Required"
     if "recommend" in s:
         return "Recommended"
     return "Optional"
 
-def check_type(series: pd.Series, dtype_str: str):
-    if dtype_str is None or pd.isna(dtype_str) or str(dtype_str).strip() == "":
+# -------------------------
+# Type checker
+# -------------------------
+def check_type(series: pd.Series, dtype_hint: str):
+    """
+    Validate values in a Series against a dtype hint from the spec.
+    Returns (ok: bool, message: str)
+    """
+    if dtype_hint is None or pd.isna(dtype_hint) or str(dtype_hint).strip() == "":
         return True, ""
-    s = str(dtype_str).lower()
+    s = str(dtype_hint).lower()
     non_null = series.dropna().astype(str)
     if non_null.empty:
         return True, ""
+    # Integer
     if ("int" in s and "float" not in s) or ("integer" in s):
         coerced = pd.to_numeric(non_null, errors="coerce")
         if coerced.isna().any():
             return False, "Contains non-integer values"
         return True, ""
+    # Numeric
     if ("number" in s) or ("float" in s) or ("price" in s) or ("percentage" in s):
         cleaned = non_null.str.replace(r"[^\d\.\-]", "", regex=True)
         coerced = pd.to_numeric(cleaned, errors="coerce")
         if coerced.isna().any():
             return False, "Contains non-numeric values"
         return True, ""
+    # Date-like
     if "date" in s or "iso" in s or "datetime" in s:
         def try_parse(x):
             for fmt in ("%Y-%m-%d","%d-%m-%Y","%m/%d/%Y","%Y/%m/%d","%Y-%m-%dT%H:%M:%S"):
@@ -380,33 +328,40 @@ def check_type(series: pd.Series, dtype_str: str):
         if not ok.all():
             return False, "Contains values not parseable as dates"
         return True, ""
+    # URL-like
     if "url" in s:
-        pattern = re.compile(r"^https?://", re.I)
-        ok = non_null.apply(lambda x: bool(pattern.search(x)))
+        ok = non_null.apply(lambda x: bool(re.search(r"^https?://", x, re.I)))
         if not ok.all():
             return False, "Some values do not start with http(s)://"
         return True, ""
+    # Default: assume string OK
     return True, ""
 
+# -------------------------
+# Supported values checker
+# -------------------------
 def check_supported_values(series: pd.Series, supported_str: str):
-    if pd.isna(supported_str) or str(supported_str).strip() == "":
+    if pd.isna(supported_str) or not supported_str:
         return True, ""
-    allowed = [a.strip().lower() for a in re.split(r"[,|;]", str(supported_str)) if a.strip() != ""]
+    allowed = [a.strip().lower() for a in re.split(r"[,|;]", str(supported_str)) if a.strip()]
     if not allowed:
         return True, ""
     non_null = series.dropna().astype(str).str.lower()
     if non_null.empty:
         return True, ""
-    bad_mask = ~non_null.isin(allowed)
-    if bad_mask.any():
-        examples = list(non_null[bad_mask].unique()[:5])
+    bad = ~non_null.isin(allowed)
+    if bad.any():
+        examples = list(non_null[bad].unique()[:6])
         return False, f"Values outside allowed set. Examples: {examples}"
     return True, ""
 
+# -------------------------
+# Validation rules parser
+# -------------------------
 def apply_validation_rules(series: pd.Series, rules_text: str):
-    if pd.isna(rules_text) or str(rules_text).strip() == "":
+    if pd.isna(rules_text) or not rules_text:
         return True, ""
-    parts = [p.strip() for p in str(rules_text).split(";") if p.strip() != ""]
+    parts = [p.strip() for p in str(rules_text).split(";") if p.strip()]
     details = []
     s = series.dropna().astype(str)
     for p in parts:
@@ -425,8 +380,8 @@ def apply_validation_rules(series: pd.Series, rules_text: str):
                 too_short = s.apply(len) < mn
                 if too_short.any():
                     details.append(f"{too_short.sum()} values shorter than min length {mn}")
-        if low.startswith("regex:") or "regex:" in low:
-            pattern = p.split("regex:", 1)[1]
+        if "regex:" in low:
+            pattern = p.split("regex:",1)[1]
             try:
                 pat = re.compile(pattern)
                 bad = ~s.apply(lambda x: bool(pat.search(x)))
@@ -435,7 +390,7 @@ def apply_validation_rules(series: pd.Series, rules_text: str):
             except Exception as e:
                 details.append(f"Invalid regex: {e}")
         if "unique" in low:
-            if "yes" in low or "true" in low or ":yes" in low:
+            if "yes" in low or "true" in low:
                 dup = s.duplicated().sum()
                 if dup > 0:
                     details.append(f"{dup} duplicate values (should be unique)")
@@ -443,145 +398,136 @@ def apply_validation_rules(series: pd.Series, rules_text: str):
     return ok, "; ".join(details)
 
 # -------------------------
-# Auto-enrichment for Shopify & general mapping
+# Enrichment: Shopify & general feed normalization
 # -------------------------
 def strip_html_tags(text):
     if not isinstance(text, str):
         return text
     return re.sub(r"<[^>]+>", "", text).strip()
 
-def enrich_record_from_shopify(raw_item: dict, flat_record: dict, default_currency: str = "USD"):
+def enrich_record_from_shopify(raw_item: dict, flat_record: dict, default_currency="USD"):
     """
-    raw_item: original JSON object for a single product (Shopify-like)
-    flat_record: current flattened dict for that product (may be modified in-place or copied)
-    This function returns a new dict with enriched fields per ChatGPT spec where possible.
+    Create enriched record (dict) combining flattened values and best-effort Shopify mappings.
     """
-    enriched = dict(flat_record)  # shallow copy
+    enriched = dict(flat_record)  # copy existing flattened values
 
-    # Title
-    if not enriched.get("title") and raw_item.get("title"):
-        enriched["title"] = raw_item.get("title")
+    # title
+    if not enriched.get("title"):
+        if raw_item.get("title"):
+            enriched["title"] = raw_item.get("title")
 
-    # Description: Shopify uses body_html
+    # description/body_html -> description (strip tags)
     if not enriched.get("description"):
-        if raw_item.get("body_html"):
-            enriched["description"] = strip_html_tags(raw_item.get("body_html"))
+        bh = raw_item.get("body_html") or raw_item.get("description") or raw_item.get("html_description")
+        if bh:
+            enriched["description"] = strip_html_tags(bh)
 
-    # Brand: vendor
-    if not enriched.get("brand") and raw_item.get("vendor"):
-        enriched["brand"] = raw_item.get("vendor")
+    # brand: vendor
+    if not enriched.get("brand"):
+        if raw_item.get("vendor"):
+            enriched["brand"] = raw_item.get("vendor")
 
-    # Product category: product_type
-    if not enriched.get("product_category") and raw_item.get("product_type"):
-        enriched["product_category"] = raw_item.get("product_type")
+    # product_category: product_type or tags
+    if not enriched.get("product_category"):
+        if raw_item.get("product_type"):
+            enriched["product_category"] = raw_item.get("product_type")
+        else:
+            tags = raw_item.get("tags")
+            if tags:
+                if isinstance(tags, list):
+                    enriched["product_category"] = ", ".join(tags[:3])
+                else:
+                    enriched["product_category"] = str(tags)
 
-    # Images: images is typically a list of dicts with src
+    # images: collect from images, media, gallery, assets, photos
     images = []
-    if "images" in raw_item and isinstance(raw_item["images"], list):
-        for img in raw_item["images"]:
-            urls = extract_urls_from_any(img)
-            for u in urls:
+    if isinstance(raw_item.get("images"), list):
+        for img in raw_item.get("images"):
+            for u in extract_urls_from_any(img):
                 if u not in images:
                     images.append(u)
-    # also check media or gallery keys
-    for alt_key in ["media", "photos", "gallery", "assets"]:
-        if alt_key in raw_item and isinstance(raw_item[alt_key], list):
-            for val in raw_item[alt_key]:
+    for alt in ["media","photos","gallery","assets"]:
+        if isinstance(raw_item.get(alt), list):
+            for val in raw_item.get(alt):
                 for u in extract_urls_from_any(val):
                     if u not in images:
                         images.append(u)
-
-    # If flat_record contains arrays of URLs in other keys, include them too
+    # also scan flattened values that may contain URLs
     for k, v in flat_record.items():
-        # v might be string like "url1|url2" or list-like; try extract
-        if isinstance(v, str) and url_re_global.search(v):
-            # split or single
-            for u in url_re_global.findall(v):
+        if isinstance(v, str) and url_re.search(v):
+            for u in url_re.findall(v):
                 if u not in images:
                     images.append(u)
 
     if images:
-        # set image_link to first, additional_image_link to rest joined by comma
         enriched["image_link"] = images[0]
         if len(images) > 1:
             enriched["additional_image_link"] = ", ".join(images[1:])
         else:
             enriched["additional_image_link"] = ""
 
-    # Variants: price, compare_at_price, sku, available, inventory_quantity
+    # variants -> price, sale_price, mpn, availability, inventory
     variants = raw_item.get("variants") or []
-    # If variants is a list of dicts
-    if variants and isinstance(variants, list):
-        # pick first variant for canonical fields if not present
-        first = variants[0] if variants else {}
+    if isinstance(variants, list) and variants:
+        # choose first variant as canonical for single-value fields
+        first = variants[0]
         # price
         if not enriched.get("price"):
-            price_val = first.get("price") or first.get("presentment_price") or None
-            if price_val is not None:
-                # price_val might be "99.00" or "99.00 USD" or numeric
-                pstr = str(price_val).strip()
-                # Does it already have three-letter currency? crude check
+            p = first.get("price") or first.get("compare_at_price") or first.get("presentment_price")
+            if p is not None:
+                pstr = str(p).strip()
                 if re.search(r"\b[A-Z]{3}\b", pstr):
                     enriched["price"] = pstr
                 else:
-                    # attach default currency
-                    enriched["price"] = f"{pstr} {default_currency}"
-        # sale_price from compare_at_price or compare_at_price > price logic
+                    enriched["price"] = f"{pstr} {default_currency}" if default_currency else pstr
+        # sale_price
         if not enriched.get("sale_price"):
             cp = first.get("compare_at_price") or first.get("compare_price")
             if cp:
-                pstr = str(cp).strip()
-                if re.search(r"\b[A-Z]{3}\b", pstr):
-                    enriched["sale_price"] = pstr
+                cpstr = str(cp).strip()
+                if re.search(r"\b[A-Z]{3}\b", cpstr):
+                    enriched["sale_price"] = cpstr
                 else:
-                    enriched["sale_price"] = f"{pstr} {default_currency}"
+                    enriched["sale_price"] = f"{cpstr} {default_currency}" if default_currency else cpstr
         # mpn from sku
         if not enriched.get("mpn"):
             sku = first.get("sku") or first.get("mpn")
             if sku:
                 enriched["mpn"] = sku
-        # availability: if any variant available True => in_stock
-        any_available = False
-        inv_total = 0
+        # availability and inventory
+        any_avail = False
+        total_inv = 0
         inv_found = False
         for v in variants:
             if v.get("available") in (True, "true", "True", 1, "1"):
-                any_available = True
-            # inventory_quantity might be int or string
-            iq = v.get("inventory_quantity")
-            if iq is not None:
+                any_avail = True
+            if v.get("inventory_quantity") is not None:
                 try:
-                    inv_total += int(iq)
+                    total_inv += int(v.get("inventory_quantity"))
                     inv_found = True
                 except:
                     pass
         if not enriched.get("availability"):
-            enriched["availability"] = "in_stock" if any_available else "out_of_stock"
+            enriched["availability"] = "in_stock" if any_avail else "out_of_stock"
         if inv_found and not enriched.get("inventory_quantity"):
-            enriched["inventory_quantity"] = inv_total
+            enriched["inventory_quantity"] = total_inv
 
-    # product URL: canonical product url may be in "handle" or "url" or "admin_graphql_api_id"
+    # link: try to use direct url-like fields if not present
     if not enriched.get("link"):
-        if raw_item.get("handle"):
-            # no host available; leave as path unless base provided — skip
-            # prefer "url" keys if present
-            pass
-        # try "url" or "product_url"
-        for key in ["url","product_url","public_url","permalink"]:
-            if raw_item.get(key):
-                enriched["link"] = raw_item.get(key)
+        for key in ["url","product_url","permalink","handle"]:
+            val = raw_item.get(key)
+            if val and isinstance(val, str) and url_re.search(val):
+                enriched["link"] = val
                 break
 
-    # other small mappings
+    # id fallback: prefer existing id, else raw id
     if not enriched.get("id") and raw_item.get("id"):
         enriched["id"] = raw_item.get("id")
 
-    # tags could form category hints (not applied directly)
-    # return enriched dict
     return enriched
 
 # -------------------------
-# Validation engine (per-product and feed-level)
+# Per-product validator
 # -------------------------
 def validate_product_record(record: dict, spec_df: pd.DataFrame):
     issues = {
@@ -594,21 +540,21 @@ def validate_product_record(record: dict, spec_df: pd.DataFrame):
         "extras": []
     }
     record_keys = {k.lower(): k for k in record.keys()}
-    spec_attrs = spec_df['Attribute'].tolist()
+    spec_attrs = spec_df["Attribute"].tolist()
     spec_norm = [a.lower() for a in spec_attrs]
 
+    # extras
     for k in record.keys():
         if k.lower() not in spec_norm:
             issues["extras"].append(k)
 
-    for _, srow in spec_df.iterrows():
-        attr = srow['Attribute']
+    for _, s in spec_df.iterrows():
+        attr = s["Attribute"]
         a_norm = attr.lower()
-        requirement = parse_requirement(srow.get('Requirement', ""))
-        dtype = srow.get('Data Type', "")
-        supported = srow.get('Supported Values', "")
-        vrules = srow.get('Validation Rules', "")
-        dependencies = srow.get('Dependencies', "")
+        requirement = parse_requirement(s.get("Requirement", ""))
+        dtype = s.get("Data Type", "")
+        supported = s.get("Supported Values", "")
+        vrules = s.get("Validation Rules", "")
 
         if a_norm not in record_keys:
             if requirement == "Required":
@@ -620,27 +566,30 @@ def validate_product_record(record: dict, spec_df: pd.DataFrame):
         orig_key = record_keys[a_norm]
         val = record.get(orig_key)
 
-        if val is None or (isinstance(val, str) and str(val).strip() == ""):
+        if val is None or (isinstance(val, str) and not str(val).strip()):
             if requirement == "Required":
                 issues["empty"].append(attr)
             continue
 
         series = pd.Series([val])
-        ok_type, tdet = check_type(series, dtype)
-        if not ok_type:
+        ok_t, tdet = check_type(series, dtype)
+        if not ok_t:
             issues["type_issues"].append(f"{attr}: {tdet}")
-        ok_vals, vdet = check_supported_values(series, supported)
-        if not ok_vals:
+        ok_v, vdet = check_supported_values(series, supported)
+        if not ok_v:
             issues["value_issues"].append(f"{attr}: {vdet}")
-        ok_rules, rdet = apply_validation_rules(series, vrules)
-        if not ok_rules:
+        ok_r, rdet = apply_validation_rules(series, vrules)
+        if not ok_r:
             issues["validation_issues"].append(f"{attr}: {rdet}")
 
     return issues
 
+# -------------------------
+# Coverage summary & feed-level validation
+# -------------------------
 def coverage_summary(feed_df: pd.DataFrame, spec_df: pd.DataFrame):
     rows = []
-    spec_list = spec_df['Attribute'].tolist()
+    spec_list = spec_df["Attribute"].tolist()
     feed_cols = list(feed_df.columns)
     feed_cols_norm = [c.lower() for c in feed_cols]
     for attr in spec_list:
@@ -653,53 +602,30 @@ def coverage_summary(feed_df: pd.DataFrame, spec_df: pd.DataFrame):
             filled_pct = 100.0 - feed_df[orig].isna().mean() * 100.0
             non_nulls = feed_df[orig].dropna().astype(str)
             example = non_nulls.iloc[0] if not non_nulls.empty else ""
-        rows.append({
-            "Attribute": attr,
-            "Present": present,
-            "% Filled": f"{filled_pct:.1f}%" if present else "0.0%",
-            "Example Value": example
-        })
+        rows.append({"Attribute": attr, "Present": present, "% Filled": f"{filled_pct:.1f}%", "Example Value": example})
     spec_set = set([s.lower() for s in spec_list])
     extras = [c for c in feed_df.columns if c.lower() not in spec_set]
     if extras:
-        rows.append({
-            "Attribute": "(Extra fields)",
-            "Present": True,
-            "% Filled": "",
-            "Example Value": ", ".join(extras[:20])
-        })
+        rows.append({"Attribute": "(Extra fields)", "Present": True, "% Filled": "", "Example Value": ", ".join(extras[:20])})
     return pd.DataFrame(rows)
 
 def validate_feed_attribute_level(spec_df: pd.DataFrame, feed_df: pd.DataFrame):
     spec_df = spec_df.copy()
-    spec_df['Attribute_norm'] = spec_df['Attribute'].astype(str).str.strip().str.lower()
+    spec_df["Attribute_norm"] = spec_df["Attribute"].astype(str).str.lower().str.strip()
     feed_cols = list(feed_df.columns)
     feed_cols_norm = [c.lower() for c in feed_cols]
     report = []
-    for _, srow in spec_df.iterrows():
-        attr = srow['Attribute']
-        a_norm = srow['Attribute_norm']
-        dtype = srow.get('Data Type', "")
-        supported = srow.get('Supported Values', "")
-        requirement = parse_requirement(srow.get('Requirement', ""))
-        vrules = srow.get('Validation Rules', "")
+    for _, s in spec_df.iterrows():
+        attr = s["Attribute"]
+        a_norm = s["Attribute_norm"]
+        dtype = s.get("Data Type", "")
+        supported = s.get("Supported Values", "")
+        requirement = parse_requirement(s.get("Requirement", ""))
+        vrules = s.get("Validation Rules", "")
 
         if a_norm not in feed_cols_norm:
-            if requirement == "Required":
-                status = "❌ Missing (Required)"
-            elif requirement == "Recommended":
-                status = "⚠️ Missing (Recommended)"
-            else:
-                status = "ℹ️ Missing (Optional)"
-            report.append({
-                "Attribute": attr,
-                "Requirement": requirement,
-                "Exists in Feed": "No",
-                "Status": status,
-                "Details": "Not present in feed",
-                "Description": srow.get("Description",""),
-                "Example": srow.get("Example","")
-            })
+            status = "❌ Missing (Required)" if requirement == "Required" else ("⚠️ Missing (Recommended)" if requirement == "Recommended" else "ℹ️ Missing (Optional)")
+            report.append({"Attribute": attr, "Requirement": requirement, "Exists in Feed": "No", "Status": status, "Details": "Not present in feed", "Description": s.get("Description",""), "Example": s.get("Example","")})
             continue
 
         orig_col = feed_cols[feed_cols_norm.index(a_norm)]
@@ -708,68 +634,41 @@ def validate_feed_attribute_level(spec_df: pd.DataFrame, feed_df: pd.DataFrame):
         empty_pct = col.isna().mean() * 100
         if empty_pct > 0:
             details.append(f"{empty_pct:.1f}% empty values")
-        ok_type, tdet = check_type(col, dtype)
-        if not ok_type:
+        ok_t, tdet = check_type(col, dtype)
+        if not ok_t:
             details.append(tdet)
-        ok_vals, vdet = check_supported_values(col, supported)
-        if not ok_vals:
+        ok_v, vdet = check_supported_values(col, supported)
+        if not ok_v:
             details.append(vdet)
-        ok_rules, rdet = apply_validation_rules(col, vrules)
-        if not ok_rules:
+        ok_r, rdet = apply_validation_rules(col, vrules)
+        if not ok_r:
             details.append(rdet)
         status = "✅ Present & Valid" if not details else "⚠️ Issues"
-        report.append({
-            "Attribute": attr,
-            "Requirement": requirement,
-            "Exists in Feed": "Yes",
-            "Status": status,
-            "Details": " | ".join(details) if details else "",
-            "Description": srow.get("Description",""),
-            "Example": srow.get("Example","")
-        })
-    spec_set = set(spec_df['Attribute_norm'].tolist())
+        report.append({"Attribute": attr, "Requirement": requirement, "Exists in Feed": "Yes", "Status": status, "Details": " | ".join(details) if details else "", "Description": s.get("Description",""), "Example": s.get("Example","")})
+    spec_set = set(spec_df["Attribute_norm"].tolist())
     extras = [c for c in feed_cols if c.lower() not in spec_set]
     if extras:
-        report.append({
-            "Attribute": "(Extra fields)",
-            "Requirement": "",
-            "Exists in Feed": "Yes",
-            "Status": f"⚠️ Extra fields ({len(extras)})",
-            "Details": f"Extra / unrecognized fields: {extras[:20]}",
-            "Description": "Fields present in feed but not specified",
-            "Example": ""
-        })
+        report.append({"Attribute": "(Extra fields)", "Requirement": "", "Exists in Feed": "Yes", "Status": f"⚠️ Extra fields ({len(extras)})", "Details": f"Extra / unrecognized fields: {extras[:20]}", "Description": "Fields present in feed but not specified", "Example": ""})
     return pd.DataFrame(report)
 
 def validate_all_products(feed_df: pd.DataFrame, spec_df: pd.DataFrame):
     rows = []
     for idx, item in feed_df.iterrows():
-        flattened_record = {k: item[k] for k in feed_df.columns}
-        issues = validate_product_record(flattened_record, spec_df)
-        prod_id = flattened_record.get('id') or flattened_record.get('ID') or flattened_record.get('Id') or ""
-        rows.append({
-            "record_index": int(idx),
-            "id": prod_id,
-            "missing": "|".join(issues["missing"]),
-            "empty": "|".join(issues["empty"]),
-            "type_issues": "|".join(issues["type_issues"]),
-            "value_issues": "|".join(issues["value_issues"]),
-            "validation_issues": "|".join(issues["validation_issues"]),
-            "dependency_notes": "|".join(issues["dependency_notes"]),
-            "extras": "|".join(issues["extras"]),
-            "has_issues": any(len(issues[k]) > 0 for k in issues)
-        })
+        flat = {k: item[k] for k in feed_df.columns}
+        issues = validate_product_record(flat, spec_df)
+        prod_id = flat.get("id") or flat.get("ID") or flat.get("Id") or ""
+        rows.append({"record_index": int(idx), "id": prod_id, "missing": "|".join(issues["missing"]), "empty": "|".join(issues["empty"]), "type_issues": "|".join(issues["type_issues"]), "value_issues": "|".join(issues["value_issues"]), "validation_issues": "|".join(issues["validation_issues"]), "dependency_notes": "|".join(issues["dependency_notes"]), "extras": "|".join(issues["extras"]), "has_issues": any(len(issues[k])>0 for k in issues)})
     return pd.DataFrame(rows)
 
 # -------------------------
-# Row-level failure extraction & mapping preview (used in UI)
+# Row-level failures & mapping preview helpers
 # -------------------------
 def extract_row_level_failures(feed_df: pd.DataFrame, spec_df: pd.DataFrame):
     rows = []
     feed_cols_norm = [c.lower() for c in feed_df.columns]
     for idx, item in feed_df.iterrows():
-        flattened_record = {k: item[k] for k in feed_df.columns}
-        prod_id = flattened_record.get("id") or ""
+        flat = {k: item[k] for k in feed_df.columns}
+        prod_id = flat.get("id") or ""
         for _, s in spec_df.iterrows():
             attr = s["Attribute"]
             a_norm = attr.lower()
@@ -779,17 +678,210 @@ def extract_row_level_failures(feed_df: pd.DataFrame, spec_df: pd.DataFrame):
             vrules = s.get("Validation Rules", "")
             if a_norm not in feed_cols_norm:
                 if requirement == "Required":
+                    rows.append({"record_index": int(idx), "id": prod_id, "attribute": attr, "issue_type": "missing", "details": "Required attribute missing", "value": ""})
+                continue
+            orig = feed_df.columns[feed_cols_norm.index(a_norm)]
+            val = flat.get(orig)
+            if val is None or (isinstance(val, str) and not str(val).strip()):
+                if requirement == "Required":
+                    rows.append({"record_index": int(idx), "id": prod_id, "attribute": attr, "issue_type": "empty", "details": "Required value empty", "value": ""})
+                continue
+            ok_t, det_t = check_type(pd.Series([val]), dtype)
+            if not ok_t:
+                rows.append({"record_index": int(idx), "id": prod_id, "attribute": attr, "issue_type": "type", "details": det_t, "value": str(val)})
+            ok_v, det_v = check_supported_values(pd.Series([val]), supported)
+            if not ok_v:
+                rows.append({"record_index": int(idx), "id": prod_id, "attribute": attr, "issue_type": "value", "details": det_v, "value": str(val)})
+            ok_r, det_r = apply_validation_rules(pd.Series([val]), vrules)
+            if not ok_r:
+                rows.append({"record_index": int(idx), "id": prod_id, "attribute": attr, "issue_type": "validation", "details": det_r, "value": str(val)})
+    if not rows:
+        return pd.DataFrame(columns=["record_index","id","attribute","issue_type","details","value"])
+    return pd.DataFrame(rows)
+
+def preview_fuzzy_mapping(feed_df: pd.DataFrame, spec_df: pd.DataFrame):
+    spec_cols = spec_df["Attribute"].tolist()
+    mapping = []
+    for c in list(feed_df.columns):
+        match = fuzzy_match_column(c, spec_cols, feed_df)
+        mapping.append({"original": c, "mapped_to": match if match else "(no match)"})
+    return pd.DataFrame(mapping)
+# ============================================================
+# PART 3 — STREAMLIT UI, MAIN FLOW, ENRICHMENT & VALIDATION RUN
+# ============================================================
+
+st.title("🔎 Auto-Enriched ChatGPT Feed Validator — Smart Mapping")
+st.write("""
+Upload a JSON or XML product feed. This tool will:
+- auto-flatten JSON/XML,
+- smart fuzzy-map columns (with title/description detection),
+- auto-enrich Shopify-style feeds into ChatGPT-spec fields,
+- validate at attribute and per-product level,
+- let you inspect products with expandable panels and download CSV reports.
+""")
+
+# Sidebar controls
+st.sidebar.header("Settings")
+max_expand = st.sidebar.number_input("Max Products to Expand in UI", min_value=10, max_value=5000, value=250, step=10)
+allow_all = st.sidebar.checkbox("Allow unlimited expanders (may be slow for large feeds)", value=False)
+default_currency = st.sidebar.text_input("Default currency to append for prices (ISO 4217)", value="USD")
+st.sidebar.markdown("---")
+st.sidebar.write("Smart mapping will preferentially map free-text columns to title/description and avoid mapping them to enums.")
+
+uploaded = st.file_uploader("📤 Upload Product Feed (JSON or XML)", type=["json", "xml"])
+if not uploaded:
+    st.info("Upload a feed file (JSON or XML) to start validation.")
+else:
+    try:
+        uploaded.seek(0)
+        ext = uploaded.name.lower().split(".")[-1]
+
+        # Parse & flatten
+        with st.spinner("Parsing feed..."):
+            if ext == "json":
+                feed_df, raw_items = json_to_records_with_raw(uploaded)
+            else:
+                feed_df = xml_to_records(uploaded)
+                raw_items = []
+
+        if feed_df is None or feed_df.empty:
+            st.error("Parsing failed — no records found. Check feed structure.")
+            st.stop()
+
+        st.success(f"Parsed {len(feed_df)} record(s).")
+
+        # Apply initial fuzzy mapping (smart)
+        with st.spinner("Applying smart fuzzy mapping..."):
+            feed_df = apply_fuzzy_mapping(feed_df, spec_df)
+
+        # Normalize column names
+        feed_df.columns = [str(c).strip() for c in feed_df.columns]
+
+        # Enrichment step for raw JSON (Shopify-like)
+        if raw_items:
+            st.info("Auto-enrichment: deriving ChatGPT-spec fields from nested JSON (Shopify-style).")
+            enriched_rows = []
+            for i in range(len(feed_df)):
+                raw = raw_items[i] if i < len(raw_items) else {}
+                flat = {k: feed_df.iloc[i][k] for k in feed_df.columns}
+                enriched = enrich_record_from_shopify(raw, flat, default_currency=default_currency)
+                enriched_rows.append(enriched)
+            enriched_df = pd.DataFrame(enriched_rows)
+            # Re-run fuzzy mapping on enrichment (ensures spec attributes are normalized)
+            enriched_df = apply_fuzzy_mapping(enriched_df, spec_df)
+            feed_df = enriched_df
+        else:
+            st.info("No nested raw JSON to enrich (XML or single-object JSON). Skipping enrichment.")
+
+        st.write("---")
+        # Attribute-level validation
+        st.markdown("## 1️⃣ Attribute-Level Validation")
+        with st.spinner("Validating feed attributes..."):
+            attr_report = validate_feed_attribute_level(spec_df, feed_df)
+        st.dataframe(attr_report, use_container_width=True)
+        st.download_button("⬇️ Download Attribute-Level Report (CSV)", attr_report.to_csv(index=False).encode("utf-8"), "attribute_report.csv", "text/csv")
+
+        # Coverage summary
+        st.markdown("## 2️⃣ Field Coverage Summary")
+        with st.spinner("Computing coverage..."):
+            cov = coverage_summary(feed_df, spec_df)
+        st.dataframe(cov, use_container_width=True)
+        st.download_button("⬇️ Download Field Coverage (CSV)", cov.to_csv(index=False).encode("utf-8"), "field_coverage.csv", "text/csv")
+
+        # Product-level validation (batch)
+        st.markdown("## 3️⃣ Product-Level Validation (Batch)")
+        with st.spinner("Validating all products..."):
+            product_report = validate_all_products(feed_df, spec_df)
+        st.success("Product-level validation complete.")
+        st.dataframe(product_report.head(200), use_container_width=True)
+        st.download_button("⬇️ Download Product-Level Issues (CSV)", product_report.to_csv(index=False).encode("utf-8"), "product_issues.csv", "text/csv")
+
+        # Expandable per-product UI
+        st.markdown("## 4️⃣ Inspect Products (Expandable Panels)")
+        expand_limit = len(feed_df) if allow_all else min(len(feed_df), max_expand)
+        st.info(f"Showing first **{expand_limit} products** (adjust in sidebar).")
+
+        for idx in range(expand_limit):
+            row = feed_df.iloc[idx]
+            flattened = {k: row[k] for k in feed_df.columns}
+            issues = validate_product_record(flattened, spec_df)
+
+            product_id = flattened.get("id") or ""
+            summary_parts = []
+            if issues["missing"]:
+                summary_parts.append("Missing: " + ", ".join(issues["missing"][:6]))
+            if issues["empty"]:
+                summary_parts.append("Empty: " + ", ".join(issues["empty"][:6]))
+            if issues["type_issues"]:
+                summary_parts.append(f"Type issues: {len(issues['type_issues'])}")
+            if issues["value_issues"]:
+                summary_parts.append(f"Value issues: {len(issues['value_issues'])}")
+            if issues["validation_issues"]:
+                summary_parts.append(f"Rule issues: {len(issues['validation_issues'])}")
+            if issues["extras"]:
+                summary_parts.append(f"Extras: {len(issues['extras'])}")
+
+            summary = " | ".join(summary_parts) if summary_parts else "No issues"
+
+            header = f"Product #{idx}"
+            if product_id:
+                header += f" — id: {product_id}"
+            header += f" — {summary}"
+
+            with st.expander(header, expanded=False):
+                st.markdown("### Issue Summary")
+                st.json(issues)
+                st.markdown("### Enriched / Flattened Fields")
+                st.dataframe(pd.DataFrame([flattened]).T.rename(columns={0: "value"}), use_container_width=True)
+
+        st.success("Inspection complete.")
+
+    except Exception as e:
+        st.error(f"Error during processing: {e}")
+        st.exception(e)
+# ============================================================
+# PART 4 — ADVANCED REPORTS, MAPPING PREVIEW, AND FOOTER
+# ============================================================
+
+# -------------------------
+# Row-level failures (detailed per-row per-attribute)
+# -------------------------
+def extract_row_level_failures(feed_df: pd.DataFrame, spec_df: pd.DataFrame):
+    """
+    Returns DataFrame columns:
+    record_index, id, attribute, issue_type (missing/empty/type/value/validation), details, value
+    """
+    rows = []
+    feed_cols_norm = [c.lower() for c in feed_df.columns]
+
+    for idx, item in feed_df.iterrows():
+        flat = {k: item[k] for k in feed_df.columns}
+        prod_id = flat.get("id") or ""
+        for _, s in spec_df.iterrows():
+            attr = s["Attribute"]
+            a_norm = attr.lower()
+            requirement = parse_requirement(s.get("Requirement", ""))
+            dtype = s.get("Data Type", "")
+            supported = s.get("Supported Values", "")
+            vrules = s.get("Validation Rules", "")
+
+            # structural missing
+            if a_norm not in feed_cols_norm:
+                if requirement == "Required":
                     rows.append({
                         "record_index": int(idx),
                         "id": prod_id,
                         "attribute": attr,
                         "issue_type": "missing",
-                        "details": "Required attribute is missing",
+                        "details": "Attribute not present in feed",
                         "value": ""
                     })
                 continue
+
             orig_col = feed_df.columns[feed_cols_norm.index(a_norm)]
-            val = flattened_record.get(orig_col)
+            val = flat.get(orig_col)
+
+            # empty
             if val is None or (isinstance(val, str) and not str(val).strip()):
                 if requirement == "Required":
                     rows.append({
@@ -797,10 +889,12 @@ def extract_row_level_failures(feed_df: pd.DataFrame, spec_df: pd.DataFrame):
                         "id": prod_id,
                         "attribute": attr,
                         "issue_type": "empty",
-                        "details": "Required value empty",
-                        "value": ""
+                        "details": "Required value empty or null",
+                        "value": "" if val is None else str(val)
                     })
                 continue
+
+            # type
             ok_t, det_t = check_type(pd.Series([val]), dtype)
             if not ok_t:
                 rows.append({
@@ -811,16 +905,20 @@ def extract_row_level_failures(feed_df: pd.DataFrame, spec_df: pd.DataFrame):
                     "details": det_t,
                     "value": str(val)
                 })
-            ok_s, det_s = check_supported_values(pd.Series([val]), supported)
-            if not ok_s:
+
+            # supported values
+            ok_v, det_v = check_supported_values(pd.Series([val]), supported)
+            if not ok_v:
                 rows.append({
                     "record_index": int(idx),
                     "id": prod_id,
                     "attribute": attr,
                     "issue_type": "value",
-                    "details": det_s,
+                    "details": det_v,
                     "value": str(val)
                 })
+
+            # validation rules
             ok_r, det_r = apply_validation_rules(pd.Series([val]), vrules)
             if not ok_r:
                 rows.append({
@@ -831,185 +929,67 @@ def extract_row_level_failures(feed_df: pd.DataFrame, spec_df: pd.DataFrame):
                     "details": det_r,
                     "value": str(val)
                 })
+
     if not rows:
         return pd.DataFrame(columns=["record_index","id","attribute","issue_type","details","value"])
     return pd.DataFrame(rows)
 
+
+# -------------------------
+# Mapping preview helper
+# -------------------------
 def preview_fuzzy_mapping(feed_df: pd.DataFrame, spec_df: pd.DataFrame):
-    spec_cols = spec_df['Attribute'].tolist()
+    spec_cols = spec_df["Attribute"].tolist()
     mapping = []
     for c in list(feed_df.columns):
-        match = fuzzy_match_column(c, spec_cols)
-        mapped = match if match else "(no match)"
-        mapping.append({"original": c, "mapped_to": mapped})
+        match = fuzzy_match_column(c, spec_cols, feed_df)
+        mapping.append({"original": c, "mapped_to": match if match else "(no match)"})
     return pd.DataFrame(mapping)
 
+
 # -------------------------
+# UI: Advanced reports + mapping preview
 # -------------------------
-# STREAMLIT UI + Main Flow
-# -------------------------
-st.title("🔎 Auto Schema Feed Validator — Auto-Enriched (Shopify-style support)")
-st.write("""
-Upload a JSON or XML feed. The tool will:
-- auto-detect and flatten records,
-- apply fuzzy header mapping,
-- auto-enrich Shopify-style fields into ChatGPT spec fields,
-- run attribute-level and product-level validation,
-- provide per-product expandable UI and downloadable reports.
-""")
+st.markdown("---")
+st.markdown("## 5️⃣ Advanced: Row-level Failures & Mapping Preview")
 
-st.sidebar.header("Settings")
-max_expand = st.sidebar.number_input("Max Products to Expand in UI", min_value=10, max_value=5000, value=250, step=10)
-allow_all = st.sidebar.checkbox("Allow unlimited expanders (slow for large feeds)", value=False)
-default_currency = st.sidebar.text_input("Default currency to append for prices (ISO 4217)", value="USD")
+col1, col2 = st.columns(2)
 
-st.sidebar.markdown("---")
-st.sidebar.write("Note: Auto-enrichment will try to generate ChatGPT-spec fields from common feed structures (Shopify etc.).")
-
-uploaded = st.file_uploader("📤 Upload Product Feed (JSON or XML)", type=["json","xml"])
-if uploaded is None:
-    st.info("Upload a feed file to start validation.")
-else:
-    try:
-        uploaded.seek(0)
-        ext = uploaded.name.lower().split(".")[-1]
-        with st.spinner("Parsing feed..."):
-            if ext == "json":
-                feed_df, raw_items = json_to_records_with_raw(uploaded)
-            else:
-                # For XML we don't have raw nested objects; use existing xml->records
-                feed_df = xml_to_records(uploaded)
-                raw_items = []
-        if feed_df is None or feed_df.empty:
-            st.error("Parsing failed — no records found. Check feed structure.")
-            st.stop()
-
-        st.success(f"Parsed {len(feed_df)} product record(s).")
-
-        # -------------------------
-        # Apply fuzzy header mapping first
-        # -------------------------
-        with st.spinner("Applying fuzzy header mapping…"):
-            feed_df = apply_fuzzy_mapping(feed_df, spec_df)
-
-        # Normalize column names (strip)
-        feed_df.columns = [str(c).strip() for c in feed_df.columns]
-
-        # -------------------------
-        # Enrichment step (Option B)
-        # -------------------------
-        if raw_items:
-            st.info("Auto-enriching records from raw JSON (Shopify-style mapping).")
-            enriched_rows = []
-            for idx in range(len(feed_df)):
-                raw = raw_items[idx] if idx < len(raw_items) else {}
-                flat = {k: feed_df.iloc[idx][k] for k in feed_df.columns}
-                enriched = enrich_record_from_shopify(raw, flat, default_currency=default_currency)
-                enriched_rows.append(enriched)
-            # Build DataFrame from enriched_rows (use keys union)
-            enriched_df = pd.DataFrame(enriched_rows)
-            # Re-apply fuzzy mapping in case enrichment created spec keys differently
-            enriched_df = apply_fuzzy_mapping(enriched_df, spec_df)
-            feed_df = enriched_df
+with col1:
+    if st.button("🔎 Generate Row-level Failures (detailed)"):
+        with st.spinner("Scanning feed for row-level failures..."):
+            failures_df = extract_row_level_failures(feed_df, spec_df)
+        if failures_df.empty:
+            st.success("No row-level failures found.")
         else:
-            st.info("No raw nested JSON available (XML or single-object JSON). Skipping Shopify auto-enrich.")
+            st.write(f"Found {len(failures_df)} row-level issues. Showing first 200 rows:")
+            st.dataframe(failures_df.head(200), use_container_width=True)
+            st.download_button(
+                "⬇️ Download full row-level failures CSV",
+                failures_df.to_csv(index=False).encode("utf-8"),
+                "row_level_failures.csv",
+                "text/csv"
+            )
 
-        # -------------------------
-        # Attribute-level validation
-        # -------------------------
-        st.markdown("## 1️⃣ Attribute-Level Validation Report")
-        with st.spinner("Validating attributes across the full feed…"):
-            attr_report = validate_feed_attribute_level(spec_df, feed_df)
-        st.dataframe(attr_report, use_container_width=True)
-        st.download_button("⬇️ Download Attribute-Level Report (CSV)", attr_report.to_csv(index=False).encode("utf-8"), "attribute_level_report.csv", "text/csv")
+with col2:
+    if st.button("🔁 Preview Smart Fuzzy Mapping"):
+        with st.spinner("Building mapping preview..."):
+            mapping_df = preview_fuzzy_mapping(feed_df, spec_df)
+        st.write("Original column → Mapped spec field (smart mapping):")
+        st.dataframe(mapping_df, use_container_width=True)
+        st.download_button(
+            "⬇️ Download mapping preview (CSV)",
+            mapping_df.to_csv(index=False).encode("utf-8"),
+            "mapping_preview.csv",
+            "text/csv"
+        )
 
-        # -------------------------
-        # Coverage summary
-        # -------------------------
-        st.markdown("## 2️⃣ Field Coverage Summary")
-        with st.spinner("Computing field coverage…"):
-            coverage = coverage_summary(feed_df, spec_df)
-        st.dataframe(coverage, use_container_width=True)
-        st.download_button("⬇️ Download Field Coverage CSV", coverage.to_csv(index=False).encode("utf-8"), "field_coverage.csv", "text/csv")
+st.markdown("---")
+st.info("Notes: Smart mapping attempts to avoid mapping long free-text fields to enumerated fields. Use the mapping preview to verify mappings. If mapping is incorrect, fix upstream source field names and re-upload.")
 
-        # -------------------------
-        # Product-level validation
-        # -------------------------
-        st.markdown("## 3️⃣ Product-Level Validation (Expandable)")
-        with st.spinner("Validating each product…"):
-            product_report = validate_all_products(feed_df, spec_df)
-        st.success("Product-level validation completed!")
-        st.dataframe(product_report.head(200), use_container_width=True)
-        st.download_button("⬇️ Download Full Product-Level Issues CSV", product_report.to_csv(index=False).encode("utf-8"), "product_level_issues.csv", "text/csv")
-
-        # Expanders
-        st.markdown("## 4️⃣ Inspect Products (Expandable Panels)")
-        if allow_all:
-            expand_limit = len(feed_df)
-        else:
-            expand_limit = min(len(feed_df), max_expand)
-        st.info(f"Showing first **{expand_limit} products** (use sidebar to increase).")
-
-        for idx in range(expand_limit):
-            row = feed_df.iloc[idx]
-            flattened_record = {k: row[k] for k in feed_df.columns}
-            issues = validate_product_record(flattened_record, spec_df)
-            product_id = flattened_record.get("id") or ""
-            issue_summary = []
-            if issues["missing"]:
-                issue_summary.append(f"Missing: {', '.join(issues['missing'][:5])}")
-            if issues["empty"]:
-                issue_summary.append(f"Empty: {', '.join(issues['empty'][:5])}")
-            if issues["type_issues"]:
-                issue_summary.append(f"Type: {len(issues['type_issues'])} issues")
-            if issues["value_issues"]:
-                issue_summary.append(f"Value: {len(issues['value_issues'])} issues")
-            if issues["validation_issues"]:
-                issue_summary.append(f"Rules: {len(issues['validation_issues'])} issues")
-            if issues["extras"]:
-                issue_summary.append(f"Extras: {len(issues['extras'])}")
-            summary_text = " | ".join(issue_summary) if issue_summary else "No issues"
-            header = f"Product #{idx}"
-            if product_id:
-                header += f" — id: {product_id}"
-            header += f" — {summary_text}"
-            with st.expander(header, expanded=False):
-                st.markdown("**Issues**")
-                st.json(issues)
-                st.markdown("**Raw flattened/enriched fields for this product**")
-                st.dataframe(pd.DataFrame([flattened_record]).T.rename(columns={0: "value"}), use_container_width=True)
-
-        # -------------------------
-        # Advanced: row-level failures & mapping preview
-        # -------------------------
-        st.markdown("---")
-        st.markdown("## 5️⃣ Advanced: Row-level failures & mapping preview")
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("🔎 Generate Row-level Failure CSV (detailed)"):
-                with st.spinner("Extracting row-level failures..."):
-                    failures_df = extract_row_level_failures(feed_df, spec_df)
-                if failures_df.empty:
-                    st.success("No row-level failures found across scanned attributes.")
-                else:
-                    st.write(f"Found {len(failures_df)} row-level issues — showing first 200 rows")
-                    st.dataframe(failures_df.head(200), use_container_width=True)
-                    st.download_button("⬇️ Download row-level failures (CSV)", failures_df.to_csv(index=False).encode("utf-8"), "row_level_failures.csv", "text/csv")
-        with col2:
-            if st.button("🔁 Preview Fuzzy Column Mapping"):
-                with st.spinner("Computing column mapping preview..."):
-                    mapping_preview = preview_fuzzy_mapping(feed_df, spec_df)
-                st.dataframe(mapping_preview, use_container_width=True)
-                st.download_button("⬇️ Download mapping preview (CSV)", mapping_preview.to_csv(index=False).encode("utf-8"), "mapping_preview.csv", "text/csv")
-
-        st.markdown("---")
-        st.info("Auto-enrichment completed. Use mapping preview to confirm automatic mappings. If a mapping is wrong, rename fields upstream and re-upload.")
-    except Exception as e:
-        st.error(f"Failed to parse/validate feed: {e}")
-        st.exception(e)
 
 # -------------------------
-# requirements (display)
+# Footer: requirements and tips
 # -------------------------
 REQ_TXT = """streamlit
 pandas
@@ -1018,3 +998,12 @@ lxml
 st.sidebar.markdown("---")
 st.sidebar.subheader("requirements.txt")
 st.sidebar.code(REQ_TXT)
+
+st.markdown("### Done — Validator Ready")
+st.write("""
+Tips & next steps:
+- To strengthen validation, enable HTTP HEAD checks for `link` and `image_link` (requires network calls).
+- To export a ChatGPT-ready JSON feed, I can add an 'Export Enriched Feed' button that outputs a JSON file matching the spec.
+- If you want stricter currency checks, I can auto-detect store currency and normalize prices.
+""")
+# End of PART 4
